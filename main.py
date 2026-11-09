@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-RAXX HOST v5 — Multi-Language Hosting + File Hosting
+RAXX HOST v6 — Multi-Language Hosting + File Hosting
 Features:
   - Upload .py / .js / .html / .zip (auto-detect, incl. Flask)
-  - ZIP inspection: pick which file to run
-  - Editable port + public URL (live restart)
+  - Path-based reverse proxy: /p/<slug>/ works on Render (single port)
+  - Editable port + public URL override
   - Unlimited file hosting with public URLs
-  - Custom dark file pickers, orbit branding, Dark/Light theme
+  - Custom dark file pickers, orbit front styling, Dark/Light theme
 """
 
-import os, sys, json, time, signal, socket, shutil, sqlite3
+import os, sys, re, json, time, signal, socket, shutil, sqlite3, http.client
 import secrets, subprocess, zipfile, atexit, mimetypes
 from datetime import datetime
 from functools import wraps
+from urllib.parse import urlsplit
 
 from flask import (Flask, request, session, redirect, url_for,
-                   render_template_string, jsonify, send_file, abort)
+                   render_template_string, jsonify, send_file, abort, Response)
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -34,6 +35,11 @@ FILES_DIR      = 'hosted_files'
 TEMP_DIR       = 'temp_uploads'
 MAX_UPLOAD_MB  = 200
 APP_TYPES      = ('python', 'node', 'static', 'flask')
+PROXY_METHODS  = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
+HOP_HEADERS    = {'host', 'connection', 'keep-alive', 'transfer-encoding',
+                  'upgrade', 'proxy-connection', 'proxy-authenticate',
+                  'proxy-authorization', 'te', 'trailer', 'accept-encoding',
+                  'content-length'}
 
 for d in (APPS_DIR, FILES_DIR, TEMP_DIR):
     os.makedirs(d, exist_ok=True)
@@ -145,6 +151,13 @@ def log_event(level, message):
         pass
 
 def find_free_port():
+    own = int(os.environ.get('PORT', '0') or 0)
+    for _ in range(60):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            p = s.getsockname()[1]
+        if p != own:
+            return p
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
@@ -174,6 +187,39 @@ def human_size(n):
         n /= 1024
     return f"{n:.1f} PB"
 
+# ════════════════════ PUBLIC URLS ════════════════════
+def external_base():
+    """Public origin when deployed on Render (or set manually)."""
+    for key in ('RENDER_EXTERNAL_URL', 'PUBLIC_BASE_URL'):
+        val = (os.environ.get(key) or '').strip().rstrip('/')
+        if val:
+            if not val.startswith(('http://', 'https://')):
+                val = 'https://' + val
+            return val
+    return ''
+
+def normalize_url(raw):
+    raw = (raw or '').strip()
+    if not raw:
+        return ''
+    if not raw.startswith(('http://', 'https://')):
+        raw = 'http://' + raw
+    return raw.rstrip('/')
+
+def app_path(slug):
+    return f'/p/{slug}/'
+
+def app_url(row, host=None):
+    """Public URL for an app: override → Render origin/path → local host:port."""
+    base = normalize_url(row['public_url'] if 'public_url' in row.keys() else '')
+    if base:
+        return base
+    ext = external_base()
+    if ext:
+        return ext + app_path(row['slug'])
+    host = host or 'localhost'
+    return f"http://{host}:{row['port']}/"
+
 # ════════════════════ APP TYPE DETECTION ════════════════════
 FLASK_HINTS = ('from flask import', 'import flask', 'flask.Flask(', 'Flask(__name__)')
 
@@ -187,21 +233,6 @@ def read_head(path, limit=24000):
 def looks_like_flask(path):
     txt = read_head(path)
     return any(h in txt for h in FLASK_HINTS)
-
-def normalize_url(raw):
-    raw = (raw or '').strip()
-    if not raw:
-        return ''
-    if not raw.startswith(('http://', 'https://')):
-        raw = 'http://' + raw
-    return raw.rstrip('/')
-
-def app_url(row, host=None):
-    base = normalize_url(row['public_url'] if 'public_url' in row.keys() else '')
-    if base:
-        return base
-    host = host or 'localhost'
-    return f"http://{host}:{row['port']}"
 
 def detect_app_type(app_dir):
     files = os.listdir(app_dir)
@@ -237,7 +268,6 @@ def detect_app_type(app_dir):
     return (None, None)
 
 def scan_zip_contents(app_dir):
-    """Returns list of all files + candidate entry points."""
     all_files = []
     entries = []
     total_size = 0
@@ -395,6 +425,7 @@ def start_app(app_id):
     env['PYTHONUNBUFFERED'] = '1'
     env['NODE_ENV'] = 'production'
     env['FLASK_DEBUG'] = '0'
+    env['BASE_PATH'] = app_path(row['slug'])
 
     try:
         if app_type in ('python', 'flask'):
@@ -499,6 +530,135 @@ def cleanup():
 
 atexit.register(cleanup)
 
+# ════════════════════ REVERSE PROXY ════════════════════
+def _rewrite_location(loc, slug):
+    if not loc:
+        return loc
+    if loc.startswith('/') and not loc.startswith('/p/'):
+        return app_path(slug) + loc.lstrip('/')
+    return loc
+
+def _rewrite_cookie(value, slug):
+    if 'path=' not in value.lower():
+        return value + f'; Path={app_path(slug)}'
+    if '/p/' in value.lower():
+        return value
+    return re.sub(r'(?i)\bpath=/', f'path={app_path(slug)}', value)
+
+def _rewrite_html(text, slug):
+    prefix = app_path(slug)
+    text = re.sub(r'(?i)(\b(?:href|src|action|poster|data-src)\s*=\s*["\'])/(?!/|p/)',
+                  lambda m: m.group(1) + prefix, text)
+    text = re.sub(r'(?i)(url\(\s*["\']?)/(?!/|p/)',
+                  lambda m: m.group(1) + prefix, text)
+    base = f'<base href="{prefix}">'
+    if re.search(r'(?i)<head[^>]*>', text):
+        text = re.sub(r'(?i)(<head[^>]*>)', lambda m: m.group(1) + base, text, count=1)
+    else:
+        text = base + text
+    return text
+
+def _error_page(code, title, detail):
+    html = f'''<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{code} — {title}</title>
+<style>body{{font-family:system-ui,sans-serif;background:#0a0a0f;color:#f0f0f5;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:24px}}
+h1{{font-size:52px;margin:0 0 8px;background:linear-gradient(135deg,#8b5cf6,#06b6d4);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+p{{color:#8b8b9e;font-size:13px;max-width:420px;line-height:1.6}}</style></head>
+<body><div><h1>{code}</h1><p>{detail}</p></div></body></html>'''
+    return Response(html, status=code, mimetype='text/html')
+
+@app.route('/p/<slug>')
+def proxy_redirect(slug):
+    qs = request.query_string.decode()
+    return redirect(app_path(slug) + (('?' + qs) if qs else ''))
+
+@app.route('/p/<slug>/', defaults={'rest': ''}, methods=PROXY_METHODS)
+@app.route('/p/<slug>/<path:rest>', methods=PROXY_METHODS)
+def proxy_app(slug, rest):
+    conn = get_db()
+    row = conn.execute('SELECT * FROM apps WHERE slug=?', (slug,)).fetchone()
+    conn.close()
+
+    if not row:
+        return _error_page(404, 'Not found', 'No hosted app with that name.')
+
+    alive = row['status'] == 'running' and is_pid_alive(row['pid'])
+    if not alive:
+        return _error_page(502, 'Not running',
+                           f'"{row["name"]}" is stopped. Start it from the console.')
+
+    target = '/' + rest
+    qs = request.query_string.decode()
+    if qs:
+        target += '?' + qs
+
+    headers = {}
+    for k, v in request.headers.items():
+        if k.lower() in HOP_HEADERS:
+            continue
+        headers[k] = v
+    headers['X-Forwarded-Host'] = request.host
+    headers['X-Forwarded-Proto'] = request.scheme
+    headers['X-Forwarded-Prefix'] = app_path(slug)
+
+    body = request.get_data() if request.method not in ('GET', 'HEAD') else None
+    if body:
+        headers['Content-Length'] = str(len(body))
+
+    upstream = None
+    try:
+        upstream = http.client.HTTPConnection('127.0.0.1', row['port'], timeout=90)
+        upstream.request(request.method, target, body=body, headers=headers)
+        resp = upstream.getresponse()
+        data = resp.read()
+        status = resp.status
+        raw_headers = resp.getheaders()
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        return _error_page(502, 'Bad gateway', f'Upstream unreachable: {e}')
+    except Exception as e:
+        return _error_page(502, 'Proxy error', str(e))
+    finally:
+        if upstream:
+            try: upstream.close()
+            except Exception: pass
+
+    ctype = ''
+    out = []
+    for k, v in raw_headers:
+        lk = k.lower()
+        if lk in ('transfer-encoding', 'connection', 'content-length',
+                  'content-encoding', 'keep-alive'):
+            continue
+        if lk == 'content-type':
+            ctype = v.lower()
+        if lk == 'location':
+            v = _rewrite_location(v, slug)
+        if lk == 'set-cookie':
+            v = _rewrite_cookie(v, slug)
+        out.append((k, v))
+
+    if 'text/html' in ctype:
+        try:
+            data = _rewrite_html(data.decode('utf-8', 'replace'), slug).encode('utf-8')
+        except Exception:
+            pass
+    elif 'text/css' in ctype:
+        try:
+            prefix = app_path(slug)
+            css = re.sub(r'(?i)(url\(\s*["\']?)/(?!/|p/)',
+                         lambda m: m.group(1) + prefix, data.decode('utf-8', 'replace'))
+            data = css.encode('utf-8')
+        except Exception:
+            pass
+
+    r = Response(data, status=status)
+    for k, v in out:
+        r.headers.add(k, v)
+    r.headers['Content-Length'] = str(len(data))
+    return r
+
 # ════════════════════ AUTH ROUTES ════════════════════
 @app.route('/')
 def index():
@@ -556,6 +716,8 @@ def system_info():
         'apps_count': apps_count,
         'files_count': files_count,
         'files_size': files_size,
+        'external': bool(external_base()),
+        'base': external_base(),
     })
 
 # ════════════════════ APP APIs ════════════════════
@@ -573,13 +735,13 @@ def list_apps():
         if d['status'] == 'running' and not d['alive']:
             d['status'] = 'stopped'
         d['url'] = app_url(r, host)
+        d['path'] = app_path(r['slug'])
         out.append(d)
     return jsonify(out)
 
 @app.route('/api/apps/analyze-zip', methods=['POST'])
 @login_required
 def analyze_zip():
-    """Upload zip → extract to temp → return file list + entry candidates."""
     if 'file' not in request.files:
         return jsonify({'error': 'No file'}), 400
     f = request.files['file']
@@ -623,7 +785,6 @@ def analyze_zip():
 @app.route('/api/apps/confirm', methods=['POST'])
 @login_required
 def confirm_app():
-    """Create app from analyzed zip temp dir."""
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
     entry = (data.get('entry') or '').strip()
@@ -671,14 +832,13 @@ def confirm_app():
 
     log_event('SUCCESS', f"Created '{name}' ({app_type}) on port {port}")
     return jsonify({
-        'id': app_id, 'slug': slug, 'port': port,
+        'id': app_id, 'slug': slug, 'port': port, 'path': app_path(slug),
         'entry': entry, 'type': app_type, 'installed': installed
     }), 201
 
 @app.route('/api/apps/create-direct', methods=['POST'])
 @login_required
 def create_direct():
-    """Direct upload of .py / .js / .html (no analysis needed)."""
     name = (request.form.get('name') or '').strip()
     if not name:
         return jsonify({'error': 'Name required'}), 400
@@ -741,7 +901,7 @@ def create_direct():
 
         log_event('SUCCESS', f"Created '{name}' ({app_type}) on port {port}")
         return jsonify({
-            'id': app_id, 'slug': slug, 'port': port,
+            'id': app_id, 'slug': slug, 'port': port, 'path': app_path(slug),
             'entry': entry, 'type': app_type, 'installed': installed
         }), 201
     except Exception as e:
@@ -758,6 +918,7 @@ def create_sample():
     code = '''from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 PORT = int(os.environ.get("PORT", "8000"))
+BASE = os.environ.get("BASE_PATH", "/")
 HTML = """<!DOCTYPE html><html><head><title>RAXX HOST</title>
 <style>
 body{font-family:system-ui,sans-serif;background:#0a0a0f;color:#f0f0f5;
@@ -770,11 +931,11 @@ font-size:12px;font-weight:700;margin-bottom:16px}
 </style></head><body><div style="text-align:center">
 <div class="pill">● RUNNING</div>
 <h1>Hello from RAXX HOST</h1>
-<p>Sample on port PORT_X</p>
+<p>Served through BASE_X on internal port PORT_X</p>
 </div></body></html>"""
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = HTML.replace("PORT_X", str(PORT)).encode()
+        body = HTML.replace("PORT_X", str(PORT)).replace("BASE_X", BASE).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -799,7 +960,7 @@ if __name__ == "__main__":
     conn.commit()
     conn.close()
     log_event('SUCCESS', f"Created sample app on port {port}")
-    return jsonify({'id': app_id, 'port': port, 'slug': slug}), 201
+    return jsonify({'id': app_id, 'port': port, 'slug': slug, 'path': app_path(slug)}), 201
 
 @app.route('/api/apps/<int:app_id>/start', methods=['POST'])
 @login_required
@@ -827,7 +988,6 @@ def api_restart(app_id):
 @app.route('/api/apps/<int:app_id>/endpoint', methods=['PUT'])
 @login_required
 def api_edit_endpoint(app_id):
-    """Edit port and/or public URL — restarts app if running."""
     data = request.get_json() or {}
 
     conn = get_db()
@@ -889,6 +1049,7 @@ def api_edit_endpoint(app_id):
         'ok': True,
         'port': new_port,
         'public_url': new_url,
+        'path': app_path(fresh['slug']),
         'url': app_url(fresh, request.host.split(':')[0]),
         'restarted': restarted
     })
@@ -896,7 +1057,6 @@ def api_edit_endpoint(app_id):
 @app.route('/api/apps/<int:app_id>/port', methods=['PUT'])
 @login_required
 def api_edit_port(app_id):
-    """Backwards-compatible port-only route."""
     return api_edit_endpoint(app_id)
 
 @app.route('/api/apps/<int:app_id>', methods=['DELETE'])
@@ -985,8 +1145,8 @@ def delete_hosted_file(file_id):
     log_event('WARN', f"Deleted hosted file: {row['filename']}")
     return jsonify({'ok': True})
 
+# Public — shareable links without login
 @app.route('/files/<int:file_id>')
-@login_required
 def serve_file(file_id):
     conn = get_db()
     row = conn.execute('SELECT * FROM hosted_files WHERE id=?', (file_id,)).fetchone()
@@ -999,7 +1159,6 @@ def serve_file(file_id):
     return send_file(path, download_name=row['filename'], as_attachment=False)
 
 @app.route('/files/<int:file_id>/download')
-@login_required
 def download_file(file_id):
     conn = get_db()
     row = conn.execute('SELECT * FROM hosted_files WHERE id=?', (file_id,)).fetchone()
@@ -1078,7 +1237,6 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 /* ═══ LIGHT THEME OVERRIDES ═══ */
 [data-theme="light"] .login-screen{background:radial-gradient(circle at 50% 0%,#e0d5ff 0%,#f5f5fa 55%)}
 [data-theme="light"] .login-card{background:rgba(255,255,255,0.92);border-color:#e0e0ea}
-[data-theme="light"] .login-card h1{color:#1a1a24}
 [data-theme="light"] .login-sub{color:#6a6a7a}
 [data-theme="light"] .form-group label{color:#4a4a5a}
 [data-theme="light"] .form-group input{background:#fff;border-color:#d5d5e0;color:#1a1a24}
@@ -1097,7 +1255,8 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 [data-theme="light"] .card{background:#fff;border-color:#e0e0ea}
 [data-theme="light"] .hero{background:linear-gradient(135deg,rgba(139,92,246,.1),rgba(6,182,212,.05));border-color:#e0e0ea}
 [data-theme="light"] .hero p{color:#5a5a6a}
-[data-theme="light"] .hero-orbit svg text{fill:#8a8a9a}
+[data-theme="light"] .hero-ring svg text{fill:#8a8a9a}
+[data-theme="light"] .tb-orbit svg text{fill:#8a8a9a}
 [data-theme="light"] .stat{background:#fff;border-color:#e0e0ea}
 [data-theme="light"] .stat-label{color:#6a6a7a}
 [data-theme="light"] .app-card{background:#fff;border-color:#e0e0ea}
@@ -1134,6 +1293,7 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 [data-theme="light"] .zip-file-list{border-color:#e0e0ea}
 [data-theme="light"] .zip-summary{background:#f8f8fc;border-color:#e0e0ea}
 [data-theme="light"] .endpoint-preview{background:#f8f8fc;border-color:#e0e0ea}
+[data-theme="light"] .path-box{background:#f8f8fc;border-color:#e0e0ea}
 
 /* ═══ LOGIN ═══ */
 .login-screen{
@@ -1177,7 +1337,11 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 }
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
 
-.login-card h1{font-size:26px;font-weight:800;text-align:center;letter-spacing:-0.5px;margin-bottom:4px}
+.login-card h1{
+  font-size:26px;font-weight:900;text-align:center;letter-spacing:-0.5px;margin-bottom:4px;
+  background:linear-gradient(135deg,#c4b5fd,#67e8f9);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
 .login-sub{color:#8b8b9e;text-align:center;font-size:13px;margin-bottom:24px}
 .form-group{margin-bottom:14px}
 .form-group label{display:block;font-size:12px;font-weight:600;color:#a0a0b0;margin-bottom:6px}
@@ -1212,7 +1376,6 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 .btn-danger:hover:not(:disabled){background:rgba(244,63,94,0.1);border-color:#f43f5e}
 .btn-sm{padding:7px 12px;font-size:12px;min-height:32px}
 .btn-block{width:100%}
-.btn-icon{width:32px;height:32px;padding:0;min-height:32px}
 
 /* ═══ LAYOUT ═══ */
 #app{display:flex;min-height:100vh}
@@ -1311,26 +1474,34 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 .page.active{display:block;animation:fadeIn .2s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
-/* ═══ HERO ═══ */
+/* ═══ HERO — orbit typography ═══ */
 .hero{
-  position:relative;overflow:hidden;border-radius:16px;padding:20px 22px;margin-bottom:18px;
+  position:relative;overflow:hidden;border-radius:18px;padding:22px;margin-bottom:18px;
   background:linear-gradient(135deg,rgba(139,92,246,.13),rgba(6,182,212,.05));
-  border:1px solid #23232d;display:flex;align-items:center;gap:20px;
+  border:1px solid #23232d;display:flex;align-items:center;gap:24px;
 }
-.hero-orbit{position:relative;width:104px;height:104px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
-.hero-orbit svg{position:absolute;inset:0;width:100%;height:100%;animation:spin 26s linear infinite}
-.hero-orbit svg text{fill:#8b8b9e;font-size:7.2px;letter-spacing:2.2px;font-weight:700;text-transform:uppercase}
-.hero-core{
-  width:44px;height:44px;border-radius:13px;z-index:2;
-  background:linear-gradient(135deg,#8b5cf6,#06b6d4);
+.hero-ring{
+  position:relative;width:230px;height:230px;flex-shrink:0;
   display:flex;align-items:center;justify-content:center;
-  color:#fff;font-weight:900;font-size:19px;
-  box-shadow:0 0 36px rgba(139,92,246,.55);
-  animation:float 6s ease-in-out infinite;
+}
+.hero-ring::after{
+  content:'';position:absolute;inset:16%;border-radius:50%;
+  background:radial-gradient(circle,rgba(139,92,246,.22),transparent 68%);
+  filter:blur(22px);animation:pulse 4s ease-in-out infinite;
+}
+.hero-ring svg{position:absolute;inset:0;width:100%;height:100%;animation:spin 36s linear infinite}
+.hero-ring svg text{
+  fill:#8b8b9e;font-size:10.5px;letter-spacing:4.6px;font-weight:800;text-transform:uppercase;
+}
+.hero-center{position:relative;z-index:2;text-align:center}
+.hero-center h2{
+  font-size:23px;font-weight:900;line-height:1.02;letter-spacing:-.6px;
+  background:linear-gradient(135deg,#c4b5fd,#67e8f9);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
 }
 .hero-body{min-width:0}
-.hero h2{font-size:17px;font-weight:800;letter-spacing:-.2px;margin-bottom:5px}
-.hero p{font-size:12.5px;color:#8b8b9e;line-height:1.6;max-width:540px}
+.hero h3{font-size:14px;font-weight:800;letter-spacing:-.2px;margin-bottom:6px}
+.hero p{font-size:12.5px;color:#8b8b9e;line-height:1.65;max-width:520px}
 
 /* ═══ CARDS ═══ */
 .card{background:#14141d;border:1px solid #23232d;border-radius:13px;padding:20px;margin-bottom:16px;transition:background .3s,border-color .3s}
@@ -1400,7 +1571,7 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 .badge.type.static{background:rgba(245,158,11,0.14);color:#fbbf24}
 .badge.type.flask{background:rgba(168,85,247,0.16);color:#c084fc}
 .badge.port{
-  background:rgba(139,92,246,0.12);color:#a5a6f6;max-width:280px;
+  background:rgba(139,92,246,0.12);color:#a5a6f6;max-width:300px;
   font-family:'SF Mono','Monaco',monospace;cursor:pointer;border:none;transition:.15s;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
@@ -1467,7 +1638,7 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
   display:flex;flex-direction:column;
   box-shadow:0 25px 80px rgba(0,0,0,0.85);
 }
-.modal-md{max-width:520px}
+.modal-md{max-width:540px}
 .modal-lg{max-width:920px}
 .modal-header{padding:18px 22px;border-bottom:1px solid #23232d;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .modal-header h3{font-size:15px;font-weight:700;margin:0}
@@ -1506,6 +1677,12 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
 }
 
 /* ═══ ENDPOINT EDITOR ═══ */
+.path-box{
+  display:flex;align-items:center;gap:8px;padding:11px 13px;margin-bottom:16px;
+  background:#0a0a0f;border:1px dashed #332b4d;border-radius:10px;
+  font-family:'SF Mono','Monaco',monospace;font-size:11.5px;color:#c084fc;
+  word-break:break-all;
+}
 .endpoint-preview{
   display:flex;align-items:center;gap:10px;padding:11px 13px;margin-top:12px;
   background:#0a0a0f;border:1px solid #26262f;border-radius:10px;
@@ -1550,9 +1727,10 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
   .stat{padding:14px}
   .stat-value{font-size:22px}
   .card{padding:16px}
-  .hero{padding:16px;gap:14px}
-  .hero-orbit{width:76px;height:76px}
-  .hero h2{font-size:15px}
+  .hero{padding:16px;gap:16px}
+  .hero-ring{width:150px;height:150px}
+  .hero-ring svg text{font-size:8px;letter-spacing:3px}
+  .hero-center h2{font-size:17px}
   .hero p{font-size:11.5px}
   .app-header{flex-direction:column;align-items:flex-start}
   .app-actions{width:100%}
@@ -1572,7 +1750,7 @@ button,input,textarea,select{font-family:inherit;font-size:inherit}
   .app-title h3{font-size:14px}
   .file-row{padding:11px 12px;gap:10px}
   .file-icon{width:36px;height:36px;font-size:16px}
-  .hero{flex-direction:column;align-items:flex-start}
+  .hero{flex-direction:column;align-items:center;text-align:center}
   .badge.port{max-width:100%}
 }
 '''
@@ -1686,18 +1864,20 @@ TEMPLATE = r'''
     <!-- DASHBOARD -->
     <section class="page active" id="page-dashboard">
       <div class="hero">
-        <div class="hero-orbit">
-          <svg viewBox="0 0 104 104">
+        <div class="hero-ring">
+          <svg viewBox="0 0 230 230">
             <defs>
-              <path id="heroOrbit" d="M 52,52 m -46,0 a 46,46 0 1,1 92,0 a 46,46 0 1,1 -92,0"/>
+              <path id="heroOrbit" d="M 115,115 m -92,0 a 92,92 0 1,1 184,0 a 92,92 0 1,1 -184,0"/>
             </defs>
-            <text><textPath href="#heroOrbit" startOffset="0">CONTROL • PLANE • LIVE •</textPath></text>
+            <text><textPath href="#heroOrbit" startOffset="0">CONTROL • PLANE • SYSTEM • ONLINE • LIVE •</textPath></text>
           </svg>
-          <div class="hero-core">R</div>
+          <div class="hero-center">
+            <h2>System<br>online</h2>
+          </div>
         </div>
         <div class="hero-body">
-          <h2>System online</h2>
-          <p>Deploy Python, Flask, Node.js or static sites, then edit ports and public URLs per app. File hosting runs alongside, all from one console.</p>
+          <h3>Every app gets a public path</h3>
+          <p>Deploy Python, Flask, Node.js or static sites. Each one is reachable at <strong>/p/&lt;name&gt;/</strong> on this same domain, so links work on Render without exposing internal ports.</p>
         </div>
       </div>
 
@@ -1779,7 +1959,7 @@ TEMPLATE = r'''
           </div>
           <div style="font-size:11.5px;color:#8b8b9e;margin-top:10px;line-height:1.7">
             <strong>Auto-detect:</strong> .py with Flask → Flask runner · .py → Python · .js → Node.js · .html → Static site · .zip → pick file to run<br>
-            Ports and public URLs are editable on every app after deploy.
+            Each app is served at <strong>/p/&lt;name&gt;/</strong> on this domain. Ports stay internal and are editable.
           </div>
         </form>
       </div>
@@ -1875,22 +2055,27 @@ TEMPLATE = r'''
       <button class="btn btn-secondary btn-sm" onclick="closeModal('endpointModal')">Close</button>
     </div>
     <div class="modal-body">
+      <div class="path-box">
+        <span style="color:#8b8b9e">PATH</span>
+        <span id="epPath">—</span>
+      </div>
+
       <p style="color:#8b8b9e;font-size:12.5px;margin-bottom:16px;line-height:1.6">
-        Set the port the app listens on and the public URL used for links. Port changes restart the app. Port range <strong>1024–65535</strong>.
+        The path above is the public link on this domain — it always works, including on Render. The port is internal only; change it if it clashes.
       </p>
 
-      <label class="form-label">Port</label>
+      <label class="form-label">Internal Port</label>
       <input type="number" id="epPort" class="input-text" min="1024" max="65535" placeholder="8080">
       <div id="epHint" style="margin-top:8px;font-size:11.5px;color:#8b8b9e"></div>
 
-      <label class="form-label" style="margin-top:16px">Public URL (optional)</label>
+      <label class="form-label" style="margin-top:16px">Public URL override (optional)</label>
       <input type="text" id="epUrl" class="input-text" placeholder="https://myapp.example.com">
       <div style="font-size:11.5px;color:#8b8b9e;margin-top:6px;line-height:1.6">
-        Leave empty to use the local host with the port. Set a domain or tunnel URL if the app is exposed externally.
+        Only for a custom domain pointed at this server. Leave empty to use the path link.
       </div>
 
       <div class="endpoint-preview">
-        <span class="ep-label">Live</span>
+        <span class="ep-label">Link</span>
         <span id="epPreview">—</span>
       </div>
       <div class="ep-actions">
@@ -2165,12 +2350,12 @@ async function loadApps() {
 
     const actions = isRunning
       ? '<button class="btn btn-secondary btn-sm" onclick="openLogs(' + a.id + ',\'' + esc(a.name) + '\')">📋 Logs</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="openEndpoint(' + a.id + ',' + a.port + ',\'' + esc(a.public_url || '') + '\',\'' + esc(a.name) + '\')">⚙ Endpoint</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="openEndpoint(' + a.id + ',' + a.port + ',\'' + esc(a.public_url || '') + '\',\'' + esc(a.name) + '\',\'' + esc(a.path) + '\')">⚙ Endpoint</button>' +
         '<button class="btn btn-secondary btn-sm" onclick="doRestart(' + a.id + ',this)">🔄 Restart</button>' +
         '<button class="btn btn-danger btn-sm" onclick="doStop(' + a.id + ',this)">⏹ Stop</button>'
       : '<button class="btn btn-success btn-sm" onclick="doStart(' + a.id + ',this)">▶ Start</button>' +
         '<button class="btn btn-secondary btn-sm" onclick="openLogs(' + a.id + ',\'' + esc(a.name) + '\')">📋 Logs</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="openEndpoint(' + a.id + ',' + a.port + ',\'' + esc(a.public_url || '') + '\',\'' + esc(a.name) + '\')">⚙ Endpoint</button>';
+        '<button class="btn btn-secondary btn-sm" onclick="openEndpoint(' + a.id + ',' + a.port + ',\'' + esc(a.public_url || '') + '\',\'' + esc(a.name) + '\',\'' + esc(a.path) + '\')">⚙ Endpoint</button>';
 
     return '<div class="app-card">' +
       '<div class="app-header">' +
@@ -2178,7 +2363,7 @@ async function loadApps() {
           '<div class="app-icon">' + typeIcon + '</div>' +
           '<div style="min-width:0">' +
             '<h3>' + esc(a.name) + '</h3>' +
-            '<div class="meta">' + esc(a.entry) + ' · ' + esc(a.slug) + '</div>' +
+            '<div class="meta">' + esc(a.entry) + ' · port ' + a.port + '</div>' +
           '</div>' +
         '</div>' +
         '<div class="app-actions">' +
@@ -2190,8 +2375,8 @@ async function loadApps() {
         '</div>' +
       '</div>' +
       '<div class="app-footer">' +
-        '<button class="badge port" onclick="window.open(\'' + esc(a.url) + '\',\'_blank\')" title="Open endpoint">🔌 ' + esc(shortUrl) + '</button>' +
-        '<button class="badge port" onclick="copyText(\'' + esc(a.url) + '\')" title="Copy endpoint">🔗 Copy</button>' +
+        '<button class="badge port" onclick="window.open(\'' + esc(a.url) + '\',\'_blank\')" title="Open link">🔌 ' + esc(shortUrl) + '</button>' +
+        '<button class="badge port" onclick="copyText(\'' + esc(a.url) + '\')" title="Copy link">🔗 Copy</button>' +
         (a.pid ? '<span><strong>PID:</strong> ' + a.pid + '</span>' : '') +
         '<span><strong>Created:</strong> ' + esc((a.created_at || '').slice(0, 10)) + '</span>' +
       '</div>' +
@@ -2240,7 +2425,7 @@ async function deployApp(e) {
     const r = await fetch('/api/apps/create-direct', { method: 'POST', body: fd });
     const data = await r.json();
     if (r.ok) {
-      toast('Deployed on port ' + data.port + ' (' + data.type + ')', 'ok');
+      toast('Deployed at ' + data.path, 'ok');
       if (data.installed && data.installed.length)
         toast('Installed: ' + data.installed.join(', '), 'info');
       form.reset();
@@ -2329,7 +2514,7 @@ async function confirmZip() {
     });
     const data = await r.json();
     if (r.ok) {
-      toast('Deployed on port ' + data.port + ' (' + data.type + ')', 'ok');
+      toast('Deployed at ' + data.path, 'ok');
       if (data.installed && data.installed.length)
         toast('Installed: ' + data.installed.join(', '), 'info');
       closeModal('zipModal');
@@ -2358,7 +2543,7 @@ async function quickSample() {
   if (!r) return;
   const data = await r.json();
   if (r.ok) {
-    toast('Sample created on port ' + data.port, 'ok');
+    toast('Sample created at ' + data.path, 'ok');
     if (document.getElementById('page-dashboard').classList.contains('active')) loadDashboard();
     if (document.getElementById('page-apps').classList.contains('active')) loadApps();
   } else {
@@ -2411,22 +2596,26 @@ async function doDelete(id, name) {
 
 /* ═══ ENDPOINT EDIT ═══ */
 let editingAppId = null;
+let editingPath = '';
 
 function buildPreview() {
   const port = document.getElementById('epPort').value.trim();
   const url = document.getElementById('epUrl').value.trim();
   if (url) return url.replace(/\/$/, '');
-  return 'http://' + location.hostname + ':' + (port || '—');
+  if (editingPath) return location.origin + editingPath;
+  return location.origin + ':' + (port || '—');
 }
 
 function refreshPreview() {
   document.getElementById('epPreview').textContent = buildPreview();
 }
 
-function openEndpoint(appId, port, publicUrl, name) {
+function openEndpoint(appId, port, publicUrl, name, path) {
   editingAppId = appId;
+  editingPath = path || '';
   document.getElementById('epPort').value = port;
   document.getElementById('epUrl').value = publicUrl || '';
+  document.getElementById('epPath').textContent = editingPath || '—';
   document.getElementById('epHint').textContent = 'Current port: ' + port + ' · App: ' + name;
   refreshPreview();
   openModal('endpointModal');
@@ -2634,6 +2823,7 @@ async function loadSettings() {
     ['Hostname', sys.hostname],
     ['OS', sys.os],
     ['Python', sys.python],
+    ['Public base', sys.base || 'local host'],
     ['psutil', sys.psutil ? '✓ Installed' : '✗ Missing'],
     ['CPU', sys.cpu !== null && sys.cpu !== undefined ? Math.round(sys.cpu) + '%' : 'N/A'],
     ['Memory', sys.memory ? Math.round(sys.memory.percent) + '%' : 'N/A'],
@@ -2687,24 +2877,25 @@ if __name__ == '__main__':
         except Exception:
             pass
 
+    port = int(os.environ.get('PORT', '5000'))
+    base = external_base() or f'http://localhost:{port}'
+
     print('\n' + '═' * 62)
-    print('  RAXX HOST v5 — Apps + Websites + File Hosting')
+    print('  RAXX HOST v6 — Apps + Websites + File Hosting')
     print('═' * 62)
-    print('  URL      : http://localhost:5000')
+    print('  Listen   : 0.0.0.0:' + str(port))
+    print('  Base URL : ' + base)
     print('  Username : ' + ADMIN_USERNAME)
     print('  Password : ' + ADMIN_PASSWORD)
-    print('  psutil   : ' + ('✓ installed' if HAS_PSUTIL else '✗ missing (optional)'))
     print('─' * 62)
+    print('  App links: ' + base + '/p/<slug>/   ← works on Render')
     print('  Uploads  : .py · .js · .html · .zip (auto-detect)')
     print('  Flask    : auto-detected, runs via flask runner on PORT')
-    print('  ZIP flow : upload → pick file → deploy')
-    print('  Endpoint : port + public URL editable (auto-restart)')
-    print('  Files    : unlimited hosting with public URLs')
-    print('─' * 62)
-    print('  TIP: Login → Apps → 🎯 Sample → ▶ Start → ⚙ Endpoint')
+    print('  Endpoint : port (internal) + public URL override')
+    print('  Files    : unlimited hosting, public URLs')
     print('═' * 62 + '\n')
 
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
     finally:
         cleanup()
